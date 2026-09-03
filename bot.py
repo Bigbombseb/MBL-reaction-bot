@@ -42,15 +42,6 @@ rosters = {}
 last_event = {}
 
 
-def build_embed(title: str, time_label: str, votes: dict) -> discord.Embed:
-    embed = discord.Embed(title=f"{title} — {time_label}", color=discord.Color.blurple())
-    for emoji, label in STATUS_EMOJIS.items():
-        names = votes.get(emoji, set())
-        value = "\n".join(f"<@{uid}>" for uid in names) if names else "—"
-        embed.add_field(name=f"{emoji} {label} ({len(names)})", value=value, inline=True)
-    return embed
-
-
 @bot.event
 async def on_ready():
     await bot.tree.sync()
@@ -77,12 +68,11 @@ async def rsvp(interaction: discord.Interaction, title: str):
     slots = {}
 
     for time_label in TIME_SLOTS:
-        votes = {emoji: set() for emoji in STATUS_EMOJIS}
-        embed = build_embed(title, time_label, votes)
-        message = await interaction.channel.send(embed=embed)
+        message = await interaction.channel.send(f"**{title} — {time_label}**")
         for emoji in STATUS_EMOJIS:
             await message.add_reaction(emoji)
 
+        votes = {emoji: set() for emoji in STATUS_EMOJIS}
         slots[time_label] = {"message_id": message.id, "votes": votes}
         message_index[message.id] = (event_id, time_label)
 
@@ -93,16 +83,6 @@ async def rsvp(interaction: discord.Interaction, title: str):
         "slots": slots,
     }
     last_event[interaction.guild_id] = event_id
-
-
-async def refresh_slot_message(event_id: str, time_label: str, channel: discord.abc.Messageable):
-    event = active_events.get(event_id)
-    if not event:
-        return
-    slot = event["slots"][time_label]
-    message = await channel.fetch_message(slot["message_id"])
-    embed = build_embed(event["title"], time_label, slot["votes"])
-    await message.edit(embed=embed)
 
 
 @bot.event
@@ -121,9 +101,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     slot = event["slots"][time_label]
     slot["votes"][emoji].add(payload.user_id)
 
-    channel = bot.get_channel(payload.channel_id)
-    await refresh_slot_message(event_id, time_label, channel)
-
 
 @bot.event
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
@@ -138,9 +115,6 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     event = active_events[event_id]
     slot = event["slots"][time_label]
     slot["votes"][emoji].discard(payload.user_id)
-
-    channel = bot.get_channel(payload.channel_id)
-    await refresh_slot_message(event_id, time_label, channel)
 
 
 @bot.tree.command(name="reactping", description="Ping roster members missing a reaction on any time slot")

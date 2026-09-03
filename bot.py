@@ -1,10 +1,12 @@
 import os
+import io
 import uuid
 from datetime import datetime, timedelta, timezone
 
 import discord
 from discord import app_commands
 from discord.ext import commands
+from PIL import Image, ImageDraw, ImageFont
 
 intents = discord.Intents.default()
 intents.reactions = True
@@ -21,13 +23,21 @@ STATUS_EMOJIS = {
     "❓": "Maybe",
 }
 
+STATUS_COLORS = {
+    "✅": (67, 181, 129),
+    "❌": (240, 71, 71),
+    "❓": (250, 166, 26),
+}
+
 # event_id -> {
 #   "title": str,
 #   "guild_id": int,
 #   "channel_id": int,
+#   "tz_offset": float,
 #   "slots": {
 #       time_label: {
 #           "message_id": int,
+#           "timestamp": int,
 #           "votes": {emoji: set(user_id)}
 #       }
 #   }
@@ -83,6 +93,86 @@ def build_timestamp(time_label: str, date_str: str, tz_offset: float) -> int:
     tz = timezone(timedelta(hours=tz_offset))
     dt = datetime(year, month, day, hour, minute, tzinfo=tz)
     return int(dt.timestamp())
+
+
+def format_slot_time(ts: int, tz_offset: float) -> str:
+    tz = timezone(timedelta(hours=tz_offset))
+    dt = datetime.fromtimestamp(ts, tz=tz)
+    return dt.strftime("%-I:%M %p")
+
+
+def load_font(size: int) -> ImageFont.FreeTypeFont:
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size)
+    return ImageFont.load_default()
+
+
+def build_summary_image(event: dict, guild: discord.Guild) -> io.BytesIO:
+    title_font = load_font(34)
+    time_font = load_font(24)
+    status_font = load_font(18)
+    name_font = load_font(16)
+
+    padding = 24
+    row_gap = 14
+    col_gap = 40
+    line_height = 22
+
+    def resolve_names(uids):
+        names = []
+        for uid in uids:
+            member = guild.get_member(uid)
+            names.append(member.display_name if member else f"User {uid}")
+        return names
+
+    # Pre-compute per-slot text blocks so we can size the canvas.
+    slot_blocks = []
+    for time_label, slot in event["slots"].items():
+        time_str = format_slot_time(slot["timestamp"], event["tz_offset"])
+        columns = []
+        for emoji, label in STATUS_EMOJIS.items():
+            names = resolve_names(slot["votes"][emoji])
+            header = f"{emoji} {label} ({len(names)})"
+            body_lines = names if names else ["—"]
+            columns.append((header, body_lines, STATUS_COLORS[emoji]))
+        slot_blocks.append((time_str, columns))
+
+    col_width = 220
+    row_height = 40 + max(
+        (max(len(c[1]) for c in cols) for _, cols in slot_blocks), default=1
+    ) * line_height + row_gap
+
+    width = padding * 2 + col_width * 3 + col_gap * 2
+    height = padding * 2 + 60 + row_height * len(slot_blocks)
+
+    img = Image.new("RGB", (width, height), (54, 57, 63))
+    draw = ImageDraw.Draw(img)
+
+    draw.text((padding, padding), event["title"], font=title_font, fill=(255, 255, 255))
+
+    y = padding + 60
+    for time_str, columns in slot_blocks:
+        draw.text((padding, y), time_str, font=time_font, fill=(220, 220, 220))
+        y += 34
+        x = padding
+        for header, body_lines, color in columns:
+            draw.text((x, y), header, font=status_font, fill=color)
+            line_y = y + 26
+            for name in body_lines:
+                draw.text((x, line_y), name, font=name_font, fill=(235, 235, 235))
+                line_y += line_height
+            x += col_width + col_gap
+        y += row_height
+
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
 
 
 @bot.event
@@ -160,29 +250,41 @@ async def rsvp(interaction: discord.Interaction, title: str, date: str = None):
 
     time_slots = get_time_slots(interaction.guild_id)
 
-    await interaction.response.send_message(f"Creating RSVP for **{title}**...", ephemeral=True)
+    try:
+        await interaction.response.send_message(f"Creating RSVP for **{title}**...", ephemeral=True)
 
-    event_id = str(uuid.uuid4())
-    slots = {}
+        event_id = str(uuid.uuid4())
+        slots = {}
 
-    for time_label in time_slots:
-        ts = build_timestamp(time_label, date_str, tz_offset)
-        message = await interaction.channel.send(f"**{title} — <t:{ts}:t>**")
-        for emoji in STATUS_EMOJIS:
-            await message.add_reaction(emoji)
-            bot_seeded.add((message.id, emoji))
+        for time_label in time_slots:
+            ts = build_timestamp(time_label, date_str, tz_offset)
+            message = await interaction.channel.send(f"**{title} — <t:{ts}:t>**")
+            for emoji in STATUS_EMOJIS:
+                await message.add_reaction(emoji)
+                bot_seeded.add((message.id, emoji))
 
-        votes = {emoji: set() for emoji in STATUS_EMOJIS}
-        slots[time_label] = {"message_id": message.id, "votes": votes}
-        message_index[message.id] = (event_id, time_label)
+            votes = {emoji: set() for emoji in STATUS_EMOJIS}
+            slots[time_label] = {
+                "message_id": message.id,
+                "timestamp": ts,
+                "votes": votes,
+            }
+            message_index[message.id] = (event_id, time_label)
 
-    active_events[event_id] = {
-        "title": title,
-        "guild_id": interaction.guild_id,
-        "channel_id": interaction.channel_id,
-        "slots": slots,
-    }
-    last_event[interaction.guild_id] = event_id
+        active_events[event_id] = {
+            "title": title,
+            "guild_id": interaction.guild_id,
+            "channel_id": interaction.channel_id,
+            "tz_offset": tz_offset,
+            "slots": slots,
+        }
+        last_event[interaction.guild_id] = event_id
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I don't have permission to send messages or add reactions in this channel. "
+            "Ask a server admin to check my role permissions.",
+            ephemeral=True,
+        )
 
 
 @bot.event
@@ -298,213 +400,23 @@ async def reactping(interaction: discord.Interaction):
     )
 
 
-if __name__ == "__main__":
-    token = os.environ.get("DISCORD_TOKEN")
-    if not token:
-        raise RuntimeError("DISCORD_TOKEN environment variable is not set.")
-    bot.run(token)
-import os
-import uuid
-import discord
-from discord import app_commands
-from discord.ext import commands
-
-intents = discord.Intents.default()
-intents.reactions = True
-intents.message_content = True
-intents.members = True  # needed to iterate role members for /reactping
-
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-TIME_SLOTS = ["8:00", "8:30", "9:00", "9:30", "10:00", "10:30", "11:00"]
-
-STATUS_EMOJIS = {
-    "✅": "Yes",
-    "❌": "No",
-    "❓": "Maybe",
-}
-
-# event_id -> {
-#   "title": str,
-#   "guild_id": int,
-#   "channel_id": int,
-#   "slots": {
-#       time_label: {
-#           "message_id": int,
-#           "votes": {emoji: set(user_id)}
-#       }
-#   }
-# }
-active_events = {}
-
-# message_id -> (event_id, time_label)   -- fast lookup for reaction events
-message_index = {}
-
-# guild_id -> role_id (the "roster")
-rosters = {}
-
-# guild_id -> most recent event_id
-last_event = {}
-
-# set of (message_id, emoji) where the bot currently holds a seed reaction
-bot_seeded = set()
-
-
-@bot.event
-async def on_ready():
-    await bot.tree.sync()
-    print(f"Logged in as {bot.user}")
-
-
-@bot.tree.command(name="setroster", description="Set the role used as the roster for /reactping")
-@app_commands.describe(role="The role whose members count as the roster")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def setroster(interaction: discord.Interaction, role: discord.Role):
-    rosters[interaction.guild_id] = role.id
-    await interaction.response.send_message(
-        f"Roster set to {role.mention}. `/reactping` will check its members.",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="rsvp", description="Create an RSVP — one message per time slot")
-@app_commands.describe(title="What are people RSVPing to?")
-async def rsvp(interaction: discord.Interaction, title: str):
-    await interaction.response.send_message(f"Creating RSVP for **{title}**...", ephemeral=True)
-
-    event_id = str(uuid.uuid4())
-    slots = {}
-
-    for time_label in TIME_SLOTS:
-        message = await interaction.channel.send(f"**{title} — {time_label}**")
-        for emoji in STATUS_EMOJIS:
-            await message.add_reaction(emoji)
-            bot_seeded.add((message.id, emoji))
-
-        votes = {emoji: set() for emoji in STATUS_EMOJIS}
-        slots[time_label] = {"message_id": message.id, "votes": votes}
-        message_index[message.id] = (event_id, time_label)
-
-    active_events[event_id] = {
-        "title": title,
-        "guild_id": interaction.guild_id,
-        "channel_id": interaction.channel_id,
-        "slots": slots,
-    }
-    last_event[interaction.guild_id] = event_id
-
-
-@bot.event
-async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    if payload.user_id == bot.user.id:
-        return
-    lookup = message_index.get(payload.message_id)
-    if not lookup:
-        return
-    event_id, time_label = lookup
-    emoji = str(payload.emoji)
-    if emoji not in STATUS_EMOJIS:
-        return
-
-    event = active_events[event_id]
-    slot = event["slots"][time_label]
-    slot["votes"][emoji].add(payload.user_id)
-
-    # A real person just reacted with this emoji — remove the bot's own
-    # seed reaction on this emoji so it stops inflating the count.
-    key = (payload.message_id, emoji)
-    if key in bot_seeded:
-        channel = bot.get_channel(payload.channel_id)
-        try:
-            message = await channel.fetch_message(payload.message_id)
-            await message.remove_reaction(emoji, bot.user)
-        except discord.HTTPException:
-            pass
-        bot_seeded.discard(key)
-
-
-@bot.event
-async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
-    lookup = message_index.get(payload.message_id)
-    if not lookup:
-        return
-    event_id, time_label = lookup
-    emoji = str(payload.emoji)
-    if emoji not in STATUS_EMOJIS:
-        return
-
-    event = active_events[event_id]
-    slot = event["slots"][time_label]
-    slot["votes"][emoji].discard(payload.user_id)
-
-    # If that was the last real reaction on this emoji, the option would
-    # vanish from the message entirely — re-add the bot's seed reaction
-    # so people can still click it.
-    key = (payload.message_id, emoji)
-    if not slot["votes"][emoji] and key not in bot_seeded:
-        channel = bot.get_channel(payload.channel_id)
-        try:
-            message = await channel.fetch_message(payload.message_id)
-            await message.add_reaction(emoji)
-        except discord.HTTPException:
-            pass
-        bot_seeded.add(key)
-
-
-@bot.tree.command(name="reactping", description="Ping roster members missing a reaction on any time slot")
-async def reactping(interaction: discord.Interaction):
+@bot.tree.command(name="summary", description="Generate a shareable image of all RSVP responses")
+async def summary(interaction: discord.Interaction):
     guild_id = interaction.guild_id
 
     event_id = last_event.get(guild_id)
     if event_id is None or event_id not in active_events:
         await interaction.response.send_message(
-            "No RSVP found to check. Run `/rsvp` first.", ephemeral=True
+            "No RSVP found to summarize. Run `/rsvp` first.", ephemeral=True
         )
         return
 
-    role_id = rosters.get(guild_id)
-    if role_id is None:
-        await interaction.response.send_message(
-            "No roster set. Use `/setroster @role` first.", ephemeral=True
-        )
-        return
-
-    role = interaction.guild.get_role(role_id)
-    if role is None:
-        await interaction.response.send_message(
-            "Roster role not found (was it deleted?).", ephemeral=True
-        )
-        return
+    await interaction.response.defer()
 
     event = active_events[event_id]
-
-    # A member "reacted" to a time slot if they used ANY of the 3 status
-    # emojis on that slot's message. They need to have reacted to EVERY slot.
-    missing_people = []
-    for member in role.members:
-        if member.bot:
-            continue
-        reacted_all = True
-        for time_label, slot in event["slots"].items():
-            reacted_this_slot = any(
-                member.id in slot["votes"][emoji] for emoji in STATUS_EMOJIS
-            )
-            if not reacted_this_slot:
-                reacted_all = False
-                break
-        if not reacted_all:
-            missing_people.append(member)
-
-    if not missing_people:
-        await interaction.response.send_message(
-            f"Everyone in {role.mention} has responded to every time slot. ✅"
-        )
-        return
-
-    mentions = " ".join(m.mention for m in missing_people)
-    await interaction.response.send_message(
-        f"⏰ Reminder for **{event['title']}** — you're missing a response on at least one time slot: {mentions}"
-    )
+    buffer = build_summary_image(event, interaction.guild)
+    file = discord.File(buffer, filename="rsvp_summary.png")
+    await interaction.followup.send(file=file)
 
 
 if __name__ == "__main__":

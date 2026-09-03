@@ -1,5 +1,6 @@
 import os
 import io
+import textwrap
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -112,16 +113,25 @@ def load_font(size: int) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default()
 
 
-def build_summary_image(event: dict, guild: discord.Guild) -> io.BytesIO:
-    title_font = load_font(34)
-    time_font = load_font(24)
-    status_font = load_font(18)
-    name_font = load_font(16)
+# Plain-text labels instead of unicode emoji — avoids "tofu box" glyphs
+# since the DejaVu fallback font has no color-emoji support.
+STATUS_LABELS = {
+    "✅": "YES",
+    "❌": "NO",
+    "❓": "MAYBE",
+}
 
-    padding = 24
-    row_gap = 14
-    col_gap = 40
-    line_height = 22
+
+def build_summary_image(event: dict, guild: discord.Guild) -> io.BytesIO:
+    title_font = load_font(28)
+    time_font = load_font(20)
+    status_font = load_font(16)
+    name_font = load_font(14)
+
+    padding = 20
+    col_gap = 30
+    line_height = 18
+    col_width = 210
 
     def resolve_names(uids):
         names = []
@@ -130,41 +140,43 @@ def build_summary_image(event: dict, guild: discord.Guild) -> io.BytesIO:
             names.append(member.display_name if member else f"User {uid}")
         return names
 
-    # Pre-compute per-slot text blocks so we can size the canvas.
+    # Pre-compute per-slot text blocks (wrapped, comma-joined names) so we
+    # can size the canvas tightly instead of always assuming worst case.
     slot_blocks = []
     for time_label, slot in event["slots"].items():
         time_str = format_slot_time(slot["timestamp"], event["tz_offset"])
         columns = []
+        max_lines = 1
         for emoji, label in STATUS_EMOJIS.items():
             names = resolve_names(slot["votes"][emoji])
-            header = f"{emoji} {label} ({len(names)})"
-            body_lines = names if names else ["—"]
-            columns.append((header, body_lines, STATUS_COLORS[emoji]))
-        slot_blocks.append((time_str, columns))
-
-    col_width = 220
-    row_height = 40 + max(
-        (max(len(c[1]) for c in cols) for _, cols in slot_blocks), default=1
-    ) * line_height + row_gap
+            header = f"{STATUS_LABELS[emoji]} ({len(names)})"
+            joined = ", ".join(names) if names else "—"
+            wrapped = textwrap.wrap(joined, width=26) or ["—"]
+            max_lines = max(max_lines, len(wrapped))
+            columns.append((header, wrapped, STATUS_COLORS[emoji]))
+        slot_blocks.append((time_str, columns, max_lines))
 
     width = padding * 2 + col_width * 3 + col_gap * 2
-    height = padding * 2 + 60 + row_height * len(slot_blocks)
+    header_height = padding + 40
+
+    row_heights = [30 + max_lines * line_height + 16 for _, _, max_lines in slot_blocks]
+    height = header_height + sum(row_heights) + padding
 
     img = Image.new("RGB", (width, height), (54, 57, 63))
     draw = ImageDraw.Draw(img)
 
     draw.text((padding, padding), event["title"], font=title_font, fill=(255, 255, 255))
 
-    y = padding + 60
-    for time_str, columns in slot_blocks:
+    y = header_height
+    for (time_str, columns, _), row_height in zip(slot_blocks, row_heights):
         draw.text((padding, y), time_str, font=time_font, fill=(220, 220, 220))
-        y += 34
+        y += 26
         x = padding
-        for header, body_lines, color in columns:
+        for header, wrapped_lines, color in columns:
             draw.text((x, y), header, font=status_font, fill=color)
-            line_y = y + 26
-            for name in body_lines:
-                draw.text((x, line_y), name, font=name_font, fill=(235, 235, 235))
+            line_y = y + 20
+            for line in wrapped_lines:
+                draw.text((x, line_y), line, font=name_font, fill=(230, 230, 230))
                 line_y += line_height
             x += col_width + col_gap
         y += row_height

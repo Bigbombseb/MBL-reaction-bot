@@ -41,6 +41,9 @@ rosters = {}
 # guild_id -> most recent event_id
 last_event = {}
 
+# set of (message_id, emoji) where the bot currently holds a seed reaction
+bot_seeded = set()
+
 
 @bot.event
 async def on_ready():
@@ -71,6 +74,7 @@ async def rsvp(interaction: discord.Interaction, title: str):
         message = await interaction.channel.send(f"**{title} — {time_label}**")
         for emoji in STATUS_EMOJIS:
             await message.add_reaction(emoji)
+            bot_seeded.add((message.id, emoji))
 
         votes = {emoji: set() for emoji in STATUS_EMOJIS}
         slots[time_label] = {"message_id": message.id, "votes": votes}
@@ -101,6 +105,18 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     slot = event["slots"][time_label]
     slot["votes"][emoji].add(payload.user_id)
 
+    # A real person just reacted with this emoji — remove the bot's own
+    # seed reaction on this emoji so it stops inflating the count.
+    key = (payload.message_id, emoji)
+    if key in bot_seeded:
+        channel = bot.get_channel(payload.channel_id)
+        try:
+            message = await channel.fetch_message(payload.message_id)
+            await message.remove_reaction(emoji, bot.user)
+        except discord.HTTPException:
+            pass
+        bot_seeded.discard(key)
+
 
 @bot.event
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
@@ -115,6 +131,19 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     event = active_events[event_id]
     slot = event["slots"][time_label]
     slot["votes"][emoji].discard(payload.user_id)
+
+    # If that was the last real reaction on this emoji, the option would
+    # vanish from the message entirely — re-add the bot's seed reaction
+    # so people can still click it.
+    key = (payload.message_id, emoji)
+    if not slot["votes"][emoji] and key not in bot_seeded:
+        channel = bot.get_channel(payload.channel_id)
+        try:
+            message = await channel.fetch_message(payload.message_id)
+            await message.add_reaction(emoji)
+        except discord.HTTPException:
+            pass
+        bot_seeded.add(key)
 
 
 @bot.tree.command(name="reactping", description="Ping roster members missing a reaction on any time slot")
